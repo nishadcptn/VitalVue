@@ -2,8 +2,10 @@ services:
   db:
     image: postgres:15.5-alpine
     container_name: vitalvue_db
-    # ports:
-    #   - "5432:5432"
+    # Only reachable from the server itself (e.g. DBeaver through an SSH tunnel to localhost:5432).
+    # Never publish 5432 on all interfaces: the database would be open to the internet.
+    ports:
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASS}

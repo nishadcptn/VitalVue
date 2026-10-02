@@ -56,7 +56,11 @@ ssh -i "$KEY_PATH" -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_IP"
   docker-compose build
 
   echo "🔹 Applying database migrations (additive; retries once if the vitals lock times out)..."
-  docker-compose up -d db redis
+  # --no-recreate: start db/redis if they aren't running, but never recreate them. docker-compose
+  # 1.29 crashes recreating a container on Docker 25+ (KeyError: 'ContainerConfig'), and a
+  # crashed recreate leaves the old one stopped (database down). Settings changes for db,
+  # redis or emqx are applied by hand: see the note printed at the end.
+  docker-compose up -d --no-recreate db redis
   # This script arrives on stdin (heredoc), and docker-compose v1 'run' forwards stdin
   # to the container even with -T, so </dev/null keeps it from eating the lines below.
   docker-compose run -T --rm --no-deps backend alembic upgrade head </dev/null || { sleep 10; docker-compose run -T --rm --no-deps backend alembic upgrade head </dev/null; }
@@ -67,7 +71,7 @@ ssh -i "$KEY_PATH" -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_IP"
   # up -d create them fresh from the new image. db/redis/emqx are left running.
   echo "🔹 Starting updated containers..."
   docker-compose rm -sf backend scheduler mqtt-worker device-gateway
-  docker-compose up -d --remove-orphans
+  docker-compose up -d --no-recreate --remove-orphans
 
   # The Docker nginx is opt-in (profile "docker-nginx"): the host nginx serves
   # vitalvue-api.genesysailabs.com here, so an old container would only crash-loop.
@@ -75,6 +79,10 @@ ssh -i "$KEY_PATH" -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_IP"
 
   echo "🔹 Cleaning up dangling Docker elements to save space..."
   docker image prune -f
+
+  echo "🔹 db, redis and emqx are never recreated by a deploy. If you changed their settings in"
+  echo "   docker-compose.yml, apply them once on the server (data volumes are kept):"
+  echo "     cd ~/vitalvue && docker-compose rm -sf <db|redis|emqx> && docker-compose up -d <db|redis|emqx>"
 
   echo "🔹 Running containers:"
   docker ps --filter name=vitalvue_ --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
