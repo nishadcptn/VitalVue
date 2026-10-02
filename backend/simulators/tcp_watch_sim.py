@@ -3,6 +3,9 @@
     python -m simulators.tcp_watch_sim --type wonlex --imei 352273017386001
     python -m simulators.tcp_watch_sim --type bpw8 --imei 867956070000018 --scenario sos
 
+Against a real server, use a test IMEI linked to a test patient: the simulator takes over the
+connection of a real watch with the same IMEI and writes into that patient's chart.
+
 Scenarios:
   normal   identify, heartbeat, then a reading of each vital every --every seconds (values in
            the NEWS2 normal range, so the patient stays Stable)
@@ -54,6 +57,8 @@ class Wonlex:
                               testType=trigger)]
         if vital == "temp":
             return [self._msg("upBodyTemperature", data=f"36.6/{random.uniform(32.5, 34.0):.1f}/27.0", testType=trigger)]
+        if vital == "hrv":
+            return [self._msg("upHRV", data=str(random.randint(30, 70)), testType=trigger)]
         return []
 
     def sos(self):
@@ -129,6 +134,8 @@ class Bpw8:
             return [self._f(f"BPUP,{t},{random.randint(68, 90)},{random.randint(112, 128)},{random.randint(72, 84)}")]
         if vital == "temp":
             return [self._f(f"TEMP,{t},{random.uniform(33.0, 35.5):.1f},26.0")]
+        if vital == "hrv":
+            return [self._f(f"HRV,{t},{random.randint(30, 70)}")]
         return []
 
     def sos(self):
@@ -191,7 +198,7 @@ async def run(args) -> None:
         await asyncio.sleep(0.5)
         await send(frame)                               # identical upload again
     else:
-        for vital in ("hr", "spo2", "bp", "temp"):
+        for vital in ("hr", "spo2", "bp", "temp", "hrv"):
             await send(watch.reading(vital))
             await asyncio.sleep(0.3)
     if args.extras:
@@ -205,7 +212,7 @@ async def run(args) -> None:
             while True:
                 await asyncio.sleep(args.every)
                 await send(watch.heartbeat())
-                for vital in ("hr", "spo2"):
+                for vital in args.vitals:
                     await send(watch.reading(vital))
         except asyncio.CancelledError:
             pass
@@ -224,10 +231,24 @@ def main() -> None:
     ap.add_argument("--scenario", choices=("normal", "sos", "removed", "resend"), default="normal")
     ap.add_argument("--every", type=float, default=0, help="normal: keep sending every N seconds (0 = once)")
     ap.add_argument("--linger", type=float, default=3, help="seconds to stay connected at the end")
+    ap.add_argument("--vitals", default="hr,spo2,hrv",
+                    help="vitals sent every round with --every (any of hr,spo2,bp,temp,hrv; default hr,spo2,hrv)")
+    ap.add_argument("--yes", action="store_true", help="don't ask before sending to a server other than this machine")
     ap.add_argument("--extras", action="store_true",
                     help="also send respiratory rate, glucose/RR intervals, steps, sleep and a GPS position once")
     args = ap.parse_args()
     args.port = args.port or (7700 if args.type == "wonlex" else 7701)
+    args.vitals = [v.strip() for v in args.vitals.split(",") if v.strip()]
+    unknown = [v for v in args.vitals if v not in ("hr", "spo2", "bp", "temp", "hrv")]
+    if unknown:
+        ap.error(f"unknown vitals: {', '.join(unknown)}")
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.yes:
+        print(f"You're about to send SIMULATED data to {args.host} as IMEI {args.imei}.\n"
+              "If that IMEI is a real watch, or is linked to a real patient, this takes over the real watch's\n"
+              "connection and writes fake vitals into that patient's chart (and can raise real alerts).\n"
+              "Use a test IMEI linked to a test patient.")
+        if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            raise SystemExit("Cancelled.")
     asyncio.run(run(args))
 
 
