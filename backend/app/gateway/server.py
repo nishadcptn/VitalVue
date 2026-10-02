@@ -33,6 +33,17 @@ log = logging.getLogger("gateway")
 COMMAND_QUEUE = GATEWAY_QUEUE
 READ_SIZE = 4096
 UNKNOWN_LOG_EVERY = timedelta(minutes=1)     # rate limit for frames from unregistered IMEIs
+FIRST_BYTES_KEPT = 160                       # bytes shown for a connection that never sent a valid frame
+
+
+def preview(data: bytes) -> str:
+    """What a connection actually sent, readable whatever it was: text with unprintable bytes as
+    '.', then the same bytes in hex (to spot a different framing, HTTP, TLS, a WebSocket…)."""
+    text = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+    more = " …" if len(data) > 64 else ""
+    return f'"{text}"  hex: {data[:64].hex(" ")}{more}'
+
+
 CONFIG_RETRY_AFTER = timedelta(minutes=2)
 MAX_CONFIG_ATTEMPTS = 3
 SCHEDULE_ACK_COMMANDS = {"deviceMeasuringFrequency"}
@@ -47,6 +58,13 @@ class Session:
         self.reader, self.writer = reader, writer
         peer = writer.get_extra_info("peername")
         self.peer = peer[0] if peer else None
+        self.peer_port = peer[1] if peer and len(peer) > 1 else None
+        # For the connection log: what arrived, and why the connection ended.
+        self.opened_at = datetime.utcnow()
+        self.bytes_in = 0
+        self.frames_in = 0
+        self.first_bytes = bytearray()        # up to FIRST_BYTES_KEPT, shown if no frame ever parses
+        self.end_reason: Optional[str] = None
         self.imei: Optional[str] = None
         self.device_id: Optional[int] = None
         self.lock = asyncio.Lock()
@@ -96,6 +114,7 @@ class Gateway:
         for server in self.servers:
             server.close()
         for s in list(self.sessions.values()):
+            s.end_reason = "gateway shutting down"
             s.close()
 
     def session_for_device(self, device_id: int) -> Optional[Session]:
@@ -103,31 +122,52 @@ class Gateway:
 
     async def on_connect(self, dtype: DeviceType, reader, writer) -> None:
         s = Session(dtype, reader, writer)
+        log.info("%s port: connection opened from %s:%s", dtype.label, s.peer, s.peer_port)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + settings.GATEWAY_FIRST_FRAME_S
         try:
             while not s.closed:
                 timeout = settings.GATEWAY_IDLE_TIMEOUT_S if s.imei else deadline - loop.time()
                 if timeout <= 0:
-                    break                                  # never identified itself
+                    s.end_reason = s.end_reason or (
+                        f"sent nothing for {settings.GATEWAY_FIRST_FRAME_S}s" if not s.bytes_in
+                        else f"no valid {dtype.label} frame within {settings.GATEWAY_FIRST_FRAME_S}s")
+                    break
                 data = await asyncio.wait_for(reader.read(READ_SIZE), timeout)
                 if not data:
+                    s.end_reason = s.end_reason or "closed by the other side"
                     break
+                s.bytes_in += len(data)
+                if len(s.first_bytes) < FIRST_BYTES_KEPT:
+                    s.first_bytes.extend(data[:FIRST_BYTES_KEPT - len(s.first_bytes)])
                 for frame in s.codec.feed(data):
+                    s.frames_in += 1
                     await self.on_frame(s, frame)
                     if s.closed:
                         break
         except asyncio.TimeoutError:
-            pass
-        except (ConnectionError, OSError):
-            pass
+            s.end_reason = s.end_reason or (f"idle for {settings.GATEWAY_IDLE_TIMEOUT_S}s" if s.imei else
+                                            f"sent nothing for {settings.GATEWAY_FIRST_FRAME_S}s" if not s.bytes_in
+                                            else f"no valid {dtype.label} frame within {settings.GATEWAY_FIRST_FRAME_S}s")
+        except (ConnectionError, OSError) as e:
+            s.end_reason = s.end_reason or f"connection error: {e.__class__.__name__}"
         except Exception:
+            s.end_reason = s.end_reason or "gateway error (see traceback)"
             log.exception("connection from %s (%s) failed", s.peer, s.imei)
         finally:
             await self.on_close(s)
 
     async def on_close(self, s: Session) -> None:
+        if s.end_reason is None:
+            s.end_reason = "closed by the gateway" if s.closed else "closed"
         s.close()
+        secs = (datetime.utcnow() - s.opened_at).total_seconds()
+        who = s.imei or "unidentified"
+        log.info("%s port: connection from %s:%s closed after %.0fs — %s · %s · %d bytes, %d frames",
+                 s.dtype.label, s.peer, s.peer_port, secs, who, s.end_reason, s.bytes_in, s.frames_in)
+        if s.imei is None and s.bytes_in:
+            # It sent something we couldn't use: show what, to tell a wrong protocol from noise.
+            log.info("%s port: first bytes from %s: %s", s.dtype.label, s.peer, preview(bytes(s.first_bytes)))
         if s.imei and self.sessions.get(s.imei) is s:
             del self.sessions[s.imei]
             async with self.session_factory() as db:
@@ -170,6 +210,7 @@ class Gateway:
             other = self.sessions.get(imei)
             if other is not None and other is not s:
                 device.duplicate_login_at = now      # a second connection for one IMEI: cloned or faked?
+                other.end_reason = f"replaced by a new connection for the same IMEI from {s.peer}"
                 other.close()
                 log.warning("%s %s connected again from %s; closed the older session", s.dtype.label, imei, s.peer)
             self.sessions[imei] = s
@@ -185,6 +226,7 @@ class Gateway:
         if dec.error or not dec.imei:
             if s.imei is None:
                 log.info("closing %s connection from %s: %s", s.dtype.label, s.peer, dec.error)
+                s.end_reason = f"first frame invalid: {dec.error}"
                 event_log.frame("IN", s.dtype.source, f"(from {s.peer})", None, dec.name, frame,
                                 status="closed", note=f"not a valid first frame: {dec.error}")
                 s.close()
@@ -193,6 +235,7 @@ class Gateway:
             return
         if s.imei is None:
             if not await self._admit(s, dec.imei, dec.name, frame):
+                s.end_reason = f"refused IMEI {dec.imei} (see the 'refused' line)"
                 s.close()
                 return
         elif dec.imei != s.imei:
@@ -211,6 +254,7 @@ class Gateway:
         async with self.session_factory() as db:
             device = await db.get(Device, s.device_id)
             if device is None or not device.is_active:
+                s.end_reason = "watch was disabled or removed"
                 s.close()
                 return
             raw = MqttRawMessage(client_id=s.imei, patient_id=device.patient_id, transport="tcp", topic=dec.name[:128],
@@ -299,6 +343,7 @@ class Gateway:
             return                                            # offline: schedules go out on reconnect
         now = datetime.utcnow()
         if kind == "kick":
+            s.end_reason = "disconnected by the server (admin disconnect, disable or archive)"
             s.close()
             return
         async with self.session_factory() as db:
@@ -360,6 +405,7 @@ class Gateway:
                     try:
                         await s.send(s.codec.encode(s.imei, ev.MeasureNow(vital), now))
                     except (ConnectionError, OSError):
+                        s.end_reason = "send failed"
                         s.close()
 
     async def retry_configs(self) -> None:

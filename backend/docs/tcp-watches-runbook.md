@@ -81,7 +81,7 @@ and created_at > date_trunc('day', now() at time zone 'utc') group by source;
 
 | Symptom | Check | Fix |
 |---|---|---|
-| Watch never shows Online | Any `unknown_device` rows for its IMEI? The note says why: *not registered*, *disabled*, or *registered as …* (wrong type or wrong port). No rows at all means it isn't reaching us | Register it or enable it with the right type. No rows: check the SMS / Wonlex config, the security group, DNS (Wonlex), and that the watch's SIM has data |
+| Watch never shows Online | Any `unknown_device` rows for its IMEI? The note says why: *not registered*, *disabled*, or *registered as …* (wrong type or wrong port). No rows at all: look for its connections in the gateway log (below) | Register it or enable it with the right type. No connection lines at all: check the SMS / Wonlex config, the security group, DNS (Wonlex), and that the watch's SIM has data |
 | Online but no vitals | Is it linked to a patient? Raw rows `parsed` but no `vitals`? `parse_error` like `implausible: …`? | Link it. Implausible values are dropped on purpose (sensor errors). A wrong watch clock is replaced with the receive time automatically |
 | Schedule **Failed** (Wonlex) | Three sends without an answer | Check the watch is online, then save the schedule again. If it keeps failing, ask Wonlex whether this firmware supports `deviceMeasuringFrequency` |
 | "Duplicate connection" warning | Two connections used the same IMEI | Normal once after a quick reconnect. If it repeats, the IMEI may be cloned or faked: disable the watch and investigate |
@@ -89,6 +89,29 @@ and created_at > date_trunc('day', now() at time zone 'utc') group by source;
 | Patient flips to offline between readings | Watch heartbeats arriving? | The patient stays online while any frame arrives within `GATEWAY_IDLE_TIMEOUT_S` (+ grace). If the watch's heartbeat interval is longer, raise it |
 | No "Watch data" on the patient tab | Any `patient_metrics` / `sleep_sessions` rows for the patient? Raw `parse_error` like `implausible: resp_rate=…`? | The panel shows only what the watch sends. Wonlex sends sleep after the night ends (around the set wake time); implausible values are dropped on purpose |
 | Measure now does nothing | Watch online? A 429 means a request in the last 2 minutes | Wait, or check the watch is worn (server-requested measurements pause while it's off the wrist) |
+
+### Is the watch reaching the server at all?
+
+The gateway logs **every** TCP connection to 7700 and 7701, always (not only with `LOG_DEVICE_EVENTS`), whether or not it ever says which watch it is:
+
+```
+CLOC BPW8 port: connection opened from 49.37.12.8:51544
+CLOC BPW8 port: connection from 49.37.12.8:51544 closed after 30s — unidentified · no valid CLOC BPW8 frame within 30s · 27 bytes, 0 frames
+CLOC BPW8 port: first bytes from 49.37.12.8: "GET / HTTP/1.1..Host: x...."  hex: 47 45 54 20 …
+```
+
+Watch them with `backend/ops/logs.sh --server gateway -f --grep port:`. How to read them:
+
+| What you see | Meaning |
+|---|---|
+| No `connection opened` line at all | Nothing reached the gateway: the watch isn't pointed at us (SMS / Wonlex config, DNS), the security group blocks the port, or the SIM has no data |
+| `sent nothing for 30s` | Something connected but said nothing: often a port scanner, or a watch waiting for the server to speak first |
+| `no valid … frame` + `first bytes` | It sent data in another format. The text and hex show what: HTTP, TLS (`16 03 …`), the other watch type's framing (wrong port), or a vendor protocol we don't speak |
+| `<IMEI> · refused IMEI …` | A real watch reached us but isn't registered / is disabled / is registered as another type (there's a `refused` line with the reason) |
+| `<IMEI> · closed by the other side` / `idle for 600s` | A known watch disconnected or went quiet: normal for reconnects and power-off |
+| `replaced by a new connection for the same IMEI` | The watch reconnected before its old connection timed out (normal once; repeated = cloned IMEI) |
+
+The internet is full of scanners, so a few `unidentified` lines from random IPs are expected and harmless.
 
 Restarting the gateway is safe: watches reconnect by themselves within a minute or two, and anything they couldn't send is resent (dedupe prevents duplicates).
 
@@ -112,7 +135,7 @@ Watch it with `backend/ops/logs.sh --server gateway -f` (or `--grep <IMEI>`). Pa
 # a simulated watch against a running gateway (scenarios: normal, sos, removed, resend)
 python -m simulators.tcp_watch_sim --type bpw8 --imei 867956070000018 --every 20
 
-# end-to-end check (API, gateway, both watch types, database, live stream): 59 checks
+# end-to-end check (API, gateway, both watch types, database, live stream): 83 checks
 DATABASE_URL=postgresql://… REDIS_URL=redis://… python -m simulators.e2e_tcp_check
 
 # load: 500 watches, one report per minute each
